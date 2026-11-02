@@ -1,0 +1,15 @@
+.git
+.venv
+venv
+env
+.runtime_deps
+__pycache__
+**/__pycache__
+.pytest_cache
+.coverage
+tmp
+.env
+.env.*
+data/traffic.db
+data/traffic.db-*
+experiments/system.log

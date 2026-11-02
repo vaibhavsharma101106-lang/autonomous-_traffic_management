@@ -1,0 +1,35 @@
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local runtime data and generated files
+data/raw/**
+data/processed/**
+data/synthetic/**
+data/traffic.db
+data/traffic.db-*
+models/detection/*.pt
+models/**/*.pkl
+models/**/*.joblib
+models/**/*.pth
+experiments/system.log
+experiments/results/**
+!submission/experiment_results/**
+tmp/
+.runtime_deps/
+
+# Editors and secrets
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

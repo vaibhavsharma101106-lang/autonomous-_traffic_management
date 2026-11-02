@@ -1,0 +1,13 @@
+scenario,controller,avg_waiting_time_s,avg_queue_length_m_per_approach,throughput_vehicles_per_hour,congestion_rate,simulation_seconds,source,seed
+low_traffic,fixed,43.5,3.29,218.0,0.0,1800,software_simulation,42
+low_traffic,rule_based,52.26,4.06,224.0,0.0,1800,software_simulation,42
+low_traffic,ai_assisted,50.22,3.91,224.0,0.0,1800,software_simulation,42
+medium_traffic,fixed,42.86,9.02,606.0,0.0,1800,software_simulation,43
+medium_traffic,rule_based,63.79,13.25,598.0,0.005,1800,software_simulation,43
+medium_traffic,ai_assisted,64.12,13.31,598.0,0.005,1800,software_simulation,43
+heavy_traffic,fixed,45.01,18.88,1208.0,0.003,1800,software_simulation,44
+heavy_traffic,rule_based,103.87,42.12,1168.0,0.19,1800,software_simulation,44
+heavy_traffic,ai_assisted,103.87,42.12,1168.0,0.19,1800,software_simulation,44
+uneven_demand,fixed,52.62,12.53,686.0,0.015,1800,software_simulation,45
+uneven_demand,rule_based,38.65,9.53,710.0,0.004,1800,software_simulation,45
+uneven_demand,ai_assisted,37.19,9.35,724.0,0.004,1800,software_simulation,45

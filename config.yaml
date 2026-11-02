@@ -1,0 +1,133 @@
+project:
+  name: AI Traffic Management System
+  version: "1.0.0"
+  description: "Human-Inspired AI for Intelligent Traffic Management and Urban Congestion Reduction"
+  course: "IT 207 Human Intelligence"
+  author: Student Project
+
+paths:
+  data_raw: data/raw
+  data_processed: data/processed
+  data_synthetic: data/synthetic
+  models: models
+  experiments: experiments
+  reports: reports
+  submission: submission
+  database: data/traffic.db
+  sumo_config: data/sumo
+
+detection:
+  model: yolo11n.pt
+  confidence: 0.45
+  iou: 0.50
+  device: auto          # 'auto' selects CUDA if available
+  # COCO classes: 2=car, 3=motorcycle, 5=bus, 7=truck
+  classes: [2, 3, 5, 7]
+  class_names: ["car", "motorcycle", "bus", "truck"]
+  imgsz: 640
+  batch_size: 1
+  half: true            # FP16 for RTX 4060
+
+tracking:
+  tracker: bytetrack
+  persist: true
+  max_lost: 30
+  min_hits: 3
+  track_high_thresh: 0.6
+  track_low_thresh: 0.1
+  new_track_thresh: 0.7
+
+analysis:
+  frame_sample_rate: 5         # Process every Nth frame
+  roi_default:
+    lane1: [[50, 280], [530, 280], [530, 480], [50, 480]]
+    lane2: [[530, 280], [1010, 280], [1010, 480], [530, 480]]
+  density_thresholds:
+    free: 5
+    moderate: 15
+    congested: 25
+  history_window: 12            # 1-minute window at 5s intervals
+  queue_depth_m: 5.0            # assumed vehicle spacing in metres
+
+prediction:
+  horizon_steps: 6             # 5 minutes at 30-second steps (10 min = 20 steps)
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  random_seed: 42
+  lstm:
+    hidden_size: 64
+    num_layers: 2
+    dropout: 0.2
+    epochs: 100
+    lr: 0.001
+    batch_size: 32
+    seq_length: 12
+    patience: 15              # early stopping
+  xgboost:
+    n_estimators: 300
+    max_depth: 6
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_weight: 1
+    gamma: 0
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+  random_forest:
+    n_estimators: 200
+    max_depth: 8
+    min_samples_split: 5
+
+optimization:
+  min_green: 10               # seconds
+  max_green: 90               # seconds
+  yellow_duration: 3          # seconds
+  all_red_duration: 2         # seconds
+  cycle_max: 240              # seconds
+  fairness_weight: 0.3
+  demand_weight: 0.5
+  wait_weight: 0.2
+  max_wait_penalty: 120       # seconds before emergency override
+
+sumo:
+  config_dir: data/sumo
+  scenario: intersection
+  step_length: 1.0            # seconds per simulation step
+  simulation_duration: 3600   # 1 hour
+  warm_up_steps: 300          # 5-minute warm-up
+  gui: false                  # headless simulation
+
+dashboard:
+  title: "AI Traffic Management — IT 207"
+  port: 8501
+  layout: wide
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  reload: false
+
+experiments:
+  scenarios:
+    - name: low_traffic
+      description: "Low vehicle flow — free-flow conditions"
+      vehicle_rate_vph: 200
+      duration_s: 1800
+    - name: medium_traffic
+      description: "Medium vehicle flow — moderate congestion"
+      vehicle_rate_vph: 600
+      duration_s: 1800
+    - name: heavy_traffic
+      description: "High vehicle flow — severe congestion"
+      vehicle_rate_vph: 1200
+      duration_s: 1800
+    - name: uneven_demand
+      description: "Asymmetric lane demand"
+      vehicle_rate_vph: 800
+      duration_s: 1800
+  controllers: [fixed, rule_based, ai_assisted]
+
+logging:
+  level: INFO
+  file: experiments/system.log
