@@ -46,12 +46,14 @@ class VehicleTracker:
                  model_path: Optional[str] = None,
                  roi_config: Optional[Dict[str, List[List[int]]]] = None,
                  max_trail: int = 30,
-                 confidence: Optional[float] = None):
+                 confidence: Optional[float] = None,
+                 imgsz: Optional[int] = None):
 
         cfg     = CONFIG["detection"]
         tr_cfg  = CONFIG["tracking"]
 
         self.confidence = confidence or cfg["confidence"]
+        self.imgsz = int(imgsz or cfg.get("imgsz", 640))
         self.max_trail  = max_trail
 
         # Device
@@ -105,7 +107,7 @@ class VehicleTracker:
             persist=True,
             conf=self.confidence,
             iou=CONFIG["detection"]["iou"],
-            imgsz=CONFIG["detection"].get("imgsz", 640),
+            imgsz=self.imgsz,
             classes=list(self.vehicle_classes.keys()),
             tracker="bytetrack.yaml",
             verbose=False,

@@ -19,7 +19,7 @@ import json
 import os
 import sys
 import time
-import tempfile
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -36,7 +36,8 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.utils import (
-    CONFIG, init_database, get_traffic_history,
+    CONFIG, init_database, get_traffic_history, create_analysis_job,
+    update_analysis_job, get_analysis_jobs, get_analysis_job,
     classify_traffic_state, state_to_color_hex, insert_traffic_observation,
 )
 from src.analysis.traffic_analyser import generate_synthetic_time_series, TrafficAnalyser
@@ -112,17 +113,19 @@ def get_models():
 
 
 @st.cache_resource(show_spinner="Loading YOLO11n weights (first run may download them)...")
-def get_vehicle_detector():
+def get_vehicle_detector(confidence=0.45, imgsz=640, roi_json="{}"):
     """Keep the expensive YOLO model loaded across Streamlit reruns."""
     from src.detection.detector import VehicleDetector
-    return VehicleDetector()
+    return VehicleDetector(confidence=confidence, imgsz=imgsz,
+                           roi_config=json.loads(roi_json) or None)
 
 
 @st.cache_resource(show_spinner="Loading ByteTrack model...")
-def get_vehicle_tracker():
+def get_vehicle_tracker(confidence=0.45, imgsz=640, roi_json="{}"):
     """Cache the tracking model so reruns do not reload its weights."""
     from src.tracking.tracker import VehicleTracker
-    return VehicleTracker()
+    return VehicleTracker(confidence=confidence, imgsz=imgsz,
+                          roi_config=json.loads(roi_json) or None)
 
 
 def _ensure_synthetic_data():
@@ -156,6 +159,7 @@ PAGES = [
     "🚦 Signal Optimization",
     "🧪 Experiments",
     "ℹ️ About & Methodology",
+    "🗂️ Analysis History",
 ]
 
 with st.sidebar:
@@ -275,115 +279,107 @@ elif page == PAGES[1]:
     st.markdown("Upload a traffic video to run YOLO11n vehicle detection and ByteTrack tracking.")
 
     uploaded = st.file_uploader("Upload traffic video", type=["mp4", "avi", "mov", "mkv"])
-    col_cfg1, col_cfg2, col_cfg3 = st.columns(3)
-    sample_rate  = col_cfg1.slider("Frame Sample Rate (every Nth)", 1, 30, 5)
-    max_frames   = col_cfg2.slider("Max Frames to Analyse", 10, 500, 100)
-    enable_track = col_cfg3.checkbox("Enable ByteTrack Tracking", value=True)
+    limit_mb = int(os.getenv("TRAFFIC_MAX_UPLOAD_MB", "500"))
+    sample_rate, max_frames, enable_track = st.columns(3)
+    sample_rate = sample_rate.slider("Frame sample interval", 1, 30, 5)
+    max_frames = max_frames.slider("Maximum sampled frames", 1, 500, 100)
+    enable_track = enable_track.checkbox("Enable ByteTrack", value=True)
+    confidence = st.slider("Detection confidence", 0.05, 0.95, 0.45, 0.05)
+    inference_size = st.select_slider("Model input size", options=[320, 480, 640, 960, 1280], value=640)
+    default_roi_json = json.dumps(CONFIG["analysis"].get("roi_default", {}), indent=2)
+    roi_text = st.text_area("Lane ROI polygons (JSON coordinates in the resized video frame)",
+                            value=default_roi_json, height=120)
 
     if uploaded is not None:
-        # Save uploaded video
-        (ROOT / "data" / "raw").mkdir(parents=True, exist_ok=True)
-        tmpfile = tempfile.NamedTemporaryFile(
-            delete=False, suffix=Path(uploaded.name).suffix, dir=str(ROOT / "data" / "raw")
-        )
-        tmpfile.write(uploaded.read())
-        tmpfile.close()
-        video_path = tmpfile.name
+        st.caption(f"{uploaded.name} · {uploaded.size / 1024 / 1024:.1f} MB (limit {limit_mb} MB)")
+        if uploaded.size > limit_mb * 1024 * 1024:
+            st.error(f"Upload exceeds the configured {limit_mb} MB limit.")
+        else:
+            fingerprint = f"{uploaded.file_id}:{uploaded.name}:{uploaded.size}"
+            if st.session_state.get("upload_fingerprint") != fingerprint:
+                from src.detection.detector import validate_video_file
+                job_id = uuid.uuid4().hex
+                upload_dir = ROOT / "data" / "raw" / "uploads"
+                upload_dir.mkdir(parents=True, exist_ok=True)
+                video_path = upload_dir / f"{job_id}{Path(uploaded.name).suffix.lower()}"
+                with video_path.open("wb") as destination:
+                    for chunk in uploaded:
+                        destination.write(chunk)
+                try:
+                    metadata = validate_video_file(str(video_path), limit_mb * 1024 * 1024)
+                    create_analysis_job(get_db(), job_id, Path(uploaded.name).name,
+                                        str(video_path), uploaded.size, metadata)
+                    st.session_state["upload_fingerprint"] = fingerprint
+                    st.session_state["analysis_job_id"] = job_id
+                except Exception as exc:
+                    video_path.unlink(missing_ok=True)
+                    st.error(f"Video validation failed: {exc}")
 
-        st.success(f"Video uploaded: {uploaded.name} ({uploaded.size / 1024:.1f} KB)")
-
-        if st.button("🔍 Analyse Video", type="primary"):
-            with st.spinner("Loading YOLO11n model and processing video..."):
+            try:
+                roi_config = json.loads(roi_text)
+                if not isinstance(roi_config, dict) or any(
+                    not isinstance(points, list) or len(points) < 3 or
+                    any(not isinstance(point, list) or len(point) != 2 or
+                        not all(isinstance(v, (int, float)) for v in point) for point in points)
+                    for points in roi_config.values()
+                ):
+                    raise ValueError("Each lane must map to a polygon with at least three [x, y] points.")
+            except (json.JSONDecodeError, ValueError) as exc:
+                roi_config = None
+                st.error(f"Invalid lane ROI JSON: {exc}")
+            job_id = st.session_state.get("analysis_job_id") if roi_config is not None else None
+            job = get_analysis_job(get_db(), job_id) if job_id else None
+            if job and job["status"] == "completed":
+                st.success(f"Validated upload ready · {job['source_width']}×{job['source_height']} · {job['duration_seconds']:.1f}s")
+            if job and st.button("🔍 Analyse video", type="primary", disabled=job["status"] == "running"):
+                output_path = ROOT / "data" / "processed" / f"{job_id}_annotated.mp4"
+                progress = st.progress(0.0, text="Starting video analysis…")
+                update_analysis_job(get_db(), job_id, status="running", sample_rate=sample_rate,
+                                    max_frames=max_frames, confidence=confidence,
+                                    inference_size=inference_size, output_path=str(output_path), error=None)
                 try:
                     from src.detection.detector import process_video_frames
-
-                    detector = get_vehicle_detector()
+                    roi_json = json.dumps(roi_config, sort_keys=True)
+                    detector = get_vehicle_detector(confidence, inference_size, roi_json)
+                    tracker = get_vehicle_tracker(confidence, inference_size, roi_json) if enable_track else None
+                    detector.reset_stats()
                     analyser = get_analyser()
-
-                    if enable_track:
-                        tracker = get_vehicle_tracker()
-
-                    (ROOT / "data" / "processed").mkdir(parents=True, exist_ok=True)
-                    output_path = str(ROOT / "data" / "processed" / "annotated_output.mp4")
-                    results = process_video_frames(
-                        video_path, detector,
-                        sample_rate=sample_rate,
-                        max_frames=max_frames,
-                        output_path=output_path,
-                    )
-
-                    st.success(f"✅ Analysed {len(results)} frames | "
-                               f"Avg latency: {detector.avg_latency_ms:.1f} ms")
+                    analysed_lane_series, totals = {}, {}
+                    def on_progress(done, expected):
+                        progress.progress(min(done / max(expected, 1), 1.0), text=f"Analyzed {done} of up to {expected} sampled frames")
+                    results = process_video_frames(str(job["video_path"]), detector,
+                        sample_rate=sample_rate, max_frames=max_frames,
+                        output_path=str(output_path), tracker=tracker,
+                        max_inference_dim=1280, progress_callback=on_progress)
+                    detection_count = tracking_count = 0
+                    for result in results:
+                        detections = result.get("detections", [])
+                        detection_count += len(detections)
+                        tracking_count += result.get("track_count", 0)
+                        analysis = analyser.analyse(result["lane_counts"], result["class_totals"],
+                                                    source="video", analysis_job_id=job_id)
+                        for lane, metric in analysis["lane_metrics"].items():
+                            analysed_lane_series.setdefault(lane, []).append({"timestamp_s": result["timestamp_s"], "count": metric["vehicle_count"]})
+                        for cls, count in result["class_totals"].items():
+                            totals[cls] = totals.get(cls, 0) + int(count)
+                    metrics = {"frames": len(results), "mean_latency_ms": detector.avg_latency_ms,
+                               "mean_sampled_vehicles_per_frame": detection_count / max(len(results), 1),
+                               "tracking_enabled": bool(tracker)}
+                    update_analysis_job(get_db(), job_id, status="completed", processed_frames=len(results),
+                                        detection_count=detection_count, tracking_count=tracking_count,
+                                        class_totals_json=totals, metrics_json=metrics)
+                    progress.progress(1.0, text="Analysis complete")
                     if results:
-                        detected_count = sum(len(frame.get("detections", [])) for frame in results)
-                        st.info(f"Annotated video saved with {detected_count} vehicle detections "
-                                f"to `{output_path}`.")
-                        st.video(output_path)
-
-                    # Aggregate results
-                    lane_series: Dict[str, List] = {}
-                    class_totals_agg: Dict[str, int] = {}
-
-                    for r in results:
-                        analysis = analyser.analyse(
-                            lane_counts=r["lane_counts"],
-                            class_totals=r["class_totals"],
-                            source="video",
-                        )
-                        for lane, m in analysis["lane_metrics"].items():
-                            lane_series.setdefault(lane, []).append({
-                                "frame": r["frame_index"],
-                                "timestamp_s": r["timestamp_s"],
-                                "count": m["vehicle_count"],
-                                "state": m["traffic_state"],
-                                "density": m["density"],
-                            })
-                        for cls, cnt in r["class_totals"].items():
-                            class_totals_agg[cls] = class_totals_agg.get(cls, 0) + cnt
-
-                    # Display results
-                    col_v1, col_v2 = st.columns(2)
-                    with col_v1:
-                        st.subheader("Vehicle Counts by Lane")
-                        for lane, series in lane_series.items():
-                            df_s = pd.DataFrame(series)
-                            fig  = px.line(df_s, x="timestamp_s", y="count",
-                                           title=f"{lane} — Vehicle Count",
-                                           color_discrete_sequence=["#1f77b4"])
-                            fig.update_layout(height=220, margin=dict(l=0, r=0, t=30, b=0))
-                            st.plotly_chart(fig, use_container_width=True)
-
-                    with col_v2:
-                        st.subheader("Vehicle Class Distribution")
-                        df_cls = pd.DataFrame(
-                            list(class_totals_agg.items()),
-                            columns=["class", "count"]
-                        )
-                        fig = px.pie(df_cls, names="class", values="count",
-                                     hole=0.4, title="Vehicle Classes Detected")
-                        fig.update_layout(height=280)
-                        st.plotly_chart(fig, use_container_width=True)
-
-                        # Traffic state summary
-                        st.subheader("Traffic State Summary")
-                        summary = analyser.congestion_summary()
-                        for state, pct in summary.items():
-                            color = state_to_color_hex(state)
-                            st.markdown(
-                                f'<div style="display:flex;align-items:center;gap:8px;">'
-                                f'<span style="background:{color};width:16px;height:16px;border-radius:3px;display:inline-block;"></span>'
-                                f'<strong>{state}</strong>: {pct:.1f}%</div>',
-                                unsafe_allow_html=True
-                            )
-
-                except Exception as e:
-                    st.error(f"Detection failed: {e}")
-                    st.info(
-                        "The first run needs internet access to download the official "
-                        "YOLO11n weights. They are stored at "
-                        "`models/weights/yolo11n.pt`; verify the dependencies in "
-                        "`requirements.txt` if loading still fails."
-                    )
+                        st.video(str(output_path))
+                        st.success(f"Processed {len(results)} sampled frames. Vehicles detected: {detection_count}; tracked: {tracking_count}.")
+                        st.json({"vehicle_classes": totals, "metrics": metrics})
+                        for lane, series in analysed_lane_series.items():
+                            st.plotly_chart(px.line(pd.DataFrame(series), x="timestamp_s", y="count", title=f"{lane} — vehicles per sampled frame"), use_container_width=True)
+                    else:
+                        st.warning("No frames were processed. Check the video decoder and sample settings.")
+                except Exception as exc:
+                    update_analysis_job(get_db(), job_id, status="failed", error=str(exc))
+                    st.error(f"Video analysis failed: {exc}")
     else:
         # Demo with synthetic data
         st.info("👆 Upload a traffic video, or view the demo below using synthetic data.")
@@ -926,6 +922,25 @@ elif page == PAGES[5]:
 # ═════════════════════════════════════════════════════════════════════════════
 # PAGE 7: ABOUT & METHODOLOGY
 # ═════════════════════════════════════════════════════════════════════════════
+elif page == PAGES[7]:
+    st.markdown("## 🗂️ Recorded Video Analysis History")
+    jobs = get_analysis_jobs(get_db(), limit=200)
+    if not jobs:
+        st.info("No uploaded-video analysis jobs have been recorded yet.")
+    for job in jobs:
+        with st.expander(f"{job['filename']} · {job['status']} · {job['created_at']}"):
+            st.write(f"Job ID: `{job['job_id']}`")
+            st.write(f"Source: {job['source_width']}×{job['source_height']} · {job['duration_seconds'] or 0:.1f} seconds")
+            if job["error"]:
+                st.error(job["error"])
+            if job["status"] == "completed":
+                st.json({"classes": job["class_totals"], "metrics": job["metrics"]})
+                output = Path(job["output_path"] or "")
+                if output.is_file():
+                    st.video(str(output))
+                    st.download_button("Download annotated video", output.read_bytes(),
+                                       file_name=f"{job['job_id']}_annotated.mp4", mime="video/mp4",
+                                       key=f"video-{job['job_id']}")
 elif page == PAGES[6]:
     st.markdown("## ℹ️ About & Methodology")
 

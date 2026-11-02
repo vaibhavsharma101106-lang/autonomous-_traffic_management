@@ -108,6 +108,7 @@ def init_database(db_path: Optional[str] = None) -> sqlite3.Connection:
     cur.executescript("""
         CREATE TABLE IF NOT EXISTS traffic_observations (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            analysis_job_id TEXT,
             timestamp       TEXT    NOT NULL,
             source          TEXT    NOT NULL DEFAULT 'video',
             lane_id         TEXT    NOT NULL,
@@ -162,7 +163,37 @@ def init_database(db_path: Optional[str] = None) -> sqlite3.Connection:
             duration_seconds    INTEGER,
             created_at          TEXT    DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS analysis_jobs (
+            job_id              TEXT PRIMARY KEY,
+            filename            TEXT NOT NULL,
+            video_path          TEXT NOT NULL,
+            output_path         TEXT,
+            status              TEXT NOT NULL DEFAULT 'uploaded',
+            error               TEXT,
+            sample_rate         INTEGER,
+            max_frames          INTEGER,
+            confidence          REAL,
+            inference_size      INTEGER,
+            file_size_bytes     INTEGER,
+            duration_seconds    REAL,
+            source_fps          REAL,
+            source_width        INTEGER,
+            source_height       INTEGER,
+            processed_frames    INTEGER DEFAULT 0,
+            detection_count     INTEGER DEFAULT 0,
+            tracking_count      INTEGER DEFAULT 0,
+            class_totals_json   TEXT DEFAULT '{}',
+            metrics_json        TEXT DEFAULT '{}',
+            created_at          TEXT NOT NULL,
+            updated_at          TEXT NOT NULL
+        );
     """)
+    observation_columns = {
+        row[1] for row in cur.execute("PRAGMA table_info(traffic_observations)")
+    }
+    if "analysis_job_id" not in observation_columns:
+        cur.execute("ALTER TABLE traffic_observations ADD COLUMN analysis_job_id TEXT")
     conn.commit()
     return conn
 
@@ -173,10 +204,11 @@ def insert_traffic_observation(conn: sqlite3.Connection,
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO traffic_observations
-        (timestamp, source, lane_id, vehicle_count, density, queue_length,
+        (analysis_job_id, timestamp, source, lane_id, vehicle_count, density, queue_length,
          traffic_state, cars, buses, trucks, motorcycles, avg_speed)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
+        data.get("analysis_job_id"),
         data.get("timestamp", datetime.now().isoformat()),
         data.get("source", "video"),
         data.get("lane_id", "lane1"),
@@ -192,6 +224,77 @@ def insert_traffic_observation(conn: sqlite3.Connection,
     ))
     conn.commit()
     return cur.lastrowid
+
+
+_ANALYSIS_JOB_FIELDS = {
+    "output_path", "status", "error", "sample_rate", "max_frames",
+    "confidence", "inference_size", "file_size_bytes", "duration_seconds",
+    "source_fps", "source_width", "source_height", "processed_frames",
+    "detection_count", "tracking_count", "class_totals_json", "metrics_json",
+}
+
+
+def create_analysis_job(conn: sqlite3.Connection, job_id: str, filename: str,
+                        video_path: str, file_size_bytes: int,
+                        metadata: Optional[Dict[str, Any]] = None) -> None:
+    """Persist an uploaded-video job and its validated source metadata."""
+    metadata = metadata or {}
+    now = datetime.now().isoformat()
+    conn.execute("""
+        INSERT INTO analysis_jobs
+        (job_id, filename, video_path, status, file_size_bytes, duration_seconds,
+         source_fps, source_width, source_height, created_at, updated_at)
+        VALUES (?, ?, ?, 'uploaded', ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        job_id, filename, video_path, int(file_size_bytes),
+        metadata.get("duration_seconds"), metadata.get("fps"),
+        metadata.get("width"), metadata.get("height"), now, now,
+    ))
+    conn.commit()
+
+
+def update_analysis_job(conn: sqlite3.Connection, job_id: str, **fields) -> None:
+    """Update only known analysis-job fields; JSON values are serialized."""
+    unknown = set(fields) - _ANALYSIS_JOB_FIELDS
+    if unknown:
+        raise ValueError(f"Unsupported analysis-job fields: {sorted(unknown)}")
+    if not fields:
+        return
+    for name in ("class_totals_json", "metrics_json"):
+        if name in fields and not isinstance(fields[name], str):
+            fields[name] = json.dumps(fields[name], sort_keys=True)
+    fields["updated_at"] = datetime.now().isoformat()
+    assignments = ", ".join(f"{name} = ?" for name in fields)
+    cursor = conn.execute(
+        f"UPDATE analysis_jobs SET {assignments} WHERE job_id = ?",
+        (*fields.values(), job_id),
+    )
+    if cursor.rowcount == 0:
+        raise KeyError(f"Analysis job not found: {job_id}")
+    conn.commit()
+
+
+def _decode_analysis_job(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    row["class_totals"] = json.loads(row.pop("class_totals_json") or "{}")
+    row["metrics"] = json.loads(row.pop("metrics_json") or "{}")
+    return row
+
+
+def get_analysis_job(conn: sqlite3.Connection, job_id: str) -> Optional[Dict[str, Any]]:
+    cursor = conn.execute("SELECT * FROM analysis_jobs WHERE job_id = ?", (job_id,))
+    row = cursor.fetchone()
+    return _decode_analysis_job(dict(zip([col[0] for col in cursor.description], row)) if row else None)
+
+
+def get_analysis_jobs(conn: sqlite3.Connection, limit: int = 100) -> List[Dict[str, Any]]:
+    cursor = conn.execute(
+        "SELECT * FROM analysis_jobs ORDER BY created_at DESC LIMIT ?",
+        (max(1, min(int(limit), 1000)),),
+    )
+    columns = [col[0] for col in cursor.description]
+    return [_decode_analysis_job(dict(zip(columns, row))) for row in cursor.fetchall()]
 
 
 def get_traffic_history(conn: sqlite3.Connection,

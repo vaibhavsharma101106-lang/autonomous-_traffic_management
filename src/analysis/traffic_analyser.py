@@ -116,7 +116,8 @@ class TrafficAnalyser:
                 class_totals: Optional[Dict[str, int]] = None,
                 timestamp: Optional[str] = None,
                 source: str = "video",
-                track_positions: Optional[Dict[int, Tuple[int, int]]] = None) -> Dict[str, Any]:
+                track_positions: Optional[Dict[int, Tuple[int, int]]] = None,
+                analysis_job_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Compute full traffic metrics for the current frame/step.
 
@@ -146,6 +147,7 @@ class TrafficAnalyser:
             metric = {
                 "timestamp":     timestamp,
                 "source":        source,
+                "analysis_job_id": analysis_job_id,
                 "lane_id":       lane_id,
                 "vehicle_count": count,
                 "density":       round(density, 4),

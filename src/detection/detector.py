@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -40,6 +40,7 @@ CLASS_COLORS_BGR: Dict[str, Tuple[int, int, int]] = {
     "truck":      (0, 140, 100),
     "unknown":    (128, 128, 128),
 }
+SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 
 
 def resolve_model_weights(model_path: Optional[str] = None) -> Path:
@@ -101,12 +102,13 @@ class VehicleDetector:
                  confidence: Optional[float] = None,
                  iou: Optional[float] = None,
                  device: Optional[str] = None,
-                 roi_config: Optional[Dict[str, List[List[int]]]] = None):
+                 roi_config: Optional[Dict[str, List[List[int]]]] = None,
+                 imgsz: Optional[int] = None):
 
         cfg = CONFIG["detection"]
         self.confidence = confidence or cfg["confidence"]
         self.iou        = iou        or cfg["iou"]
-        self.imgsz      = cfg.get("imgsz", 640)
+        self.imgsz      = int(imgsz or cfg.get("imgsz", 640))
         self.half       = cfg.get("half", False)
 
         # Device selection
@@ -287,11 +289,59 @@ class VehicleDetector:
 
 
 # ── Batch video processing ────────────────────────────────────────────────────
+def validate_video_file(video_path: str,
+                        max_size_bytes: int = 500 * 1024 * 1024) -> Dict[str, float]:
+    """Validate an uploaded video and return decoder metadata before analysis."""
+    path = Path(video_path)
+    if path.suffix.lower() not in SUPPORTED_VIDEO_EXTENSIONS:
+        raise ValueError(
+            f"Unsupported video format '{path.suffix or '(no extension)'}'. "
+            f"Supported formats: {', '.join(sorted(SUPPORTED_VIDEO_EXTENSIONS))}."
+        )
+    if not path.is_file():
+        raise FileNotFoundError(f"Video file does not exist: {path}")
+    size = path.stat().st_size
+    if size <= 0:
+        raise ValueError("The uploaded video file is empty.")
+    if size > max_size_bytes:
+        max_mb = max_size_bytes / (1024 * 1024)
+        raise ValueError(f"Video is too large ({size / (1024 * 1024):.1f} MB). Maximum is {max_mb:.0f} MB.")
+
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            raise ValueError("OpenCV could not decode this video. Try an MP4 encoded with H.264.")
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        readable, first_frame = cap.read()
+        if not readable or first_frame is None:
+            raise ValueError("The video opened, but no frames could be decoded.")
+        if width <= 0 or height <= 0 or frame_count <= 0:
+            raise ValueError("The video has invalid dimensions or no frames.")
+        if not np.isfinite(fps) or fps <= 0:
+            raise ValueError("The video reports an invalid frame rate.")
+        return {
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "frame_count": frame_count,
+            "duration_seconds": frame_count / fps,
+            "file_size_bytes": size,
+        }
+    finally:
+        cap.release()
+
+
 def process_video_frames(video_path: str,
                           detector: VehicleDetector,
                           sample_rate: int = 5,
                           max_frames: Optional[int] = None,
-                          output_path: Optional[str] = None) -> List[Dict]:
+                          output_path: Optional[str] = None,
+                          tracker=None,
+                          max_inference_dim: int = 1280,
+                          progress_callback: Optional[Callable[[int, int], None]] = None) -> List[Dict]:
     """
     Process a video file frame-by-frame, returning detection results.
 
@@ -301,53 +351,97 @@ def process_video_frames(video_path: str,
         sample_rate:  Analyse every Nth frame (reduces compute).
         max_frames:   Stop after this many analysed frames (None = all).
         output_path:  If provided, write annotated video here.
+        tracker:      Optional ByteTrack VehicleTracker used instead of detection-only inference.
+        max_inference_dim: Resize the longest frame dimension before inference and output.
+        progress_callback: Optional callback receiving (processed, expected) frame counts.
 
     Returns:
         List of per-frame detection result dicts.
     """
+    if sample_rate < 1:
+        raise ValueError("Frame sample rate must be at least 1.")
+    if max_frames is not None and max_frames < 1:
+        raise ValueError("Maximum frame count must be at least 1 when provided.")
+    if max_inference_dim < 320:
+        raise ValueError("Inference frame size must be at least 320 pixels.")
+    metadata = validate_video_file(video_path)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {video_path}")
 
-    fps    = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = metadata["fps"]
+    width = metadata["width"]
+    height = metadata["height"]
+    total = metadata["frame_count"]
+    scale = min(1.0, max_inference_dim / max(width, height))
+    output_width = max(1, int(round(width * scale)))
+    output_height = max(1, int(round(height * scale)))
+    expected = max(1, int(np.ceil(total / sample_rate)))
+    if max_frames is not None:
+        expected = min(expected, max_frames)
 
     writer = None
     if output_path:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(output_path), fourcc, fps / sample_rate,
-                                 (width, height))
+        writer = cv2.VideoWriter(str(output_path), fourcc, max(fps / sample_rate, 0.1),
+                                 (output_width, output_height))
+        if not writer.isOpened():
+            cap.release()
+            raise ValueError(f"Could not create annotated video output: {output_path}")
 
     results_list: List[Dict] = []
     frame_idx, analysed = 0, 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_idx += 1
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_idx += 1
+            if (frame_idx - 1) % sample_rate != 0:
+                continue
 
-        if frame_idx % sample_rate != 0:
-            continue
+            inference_frame = (
+                cv2.resize(frame, (output_width, output_height), interpolation=cv2.INTER_AREA)
+                if scale < 1.0 else frame
+            )
+            if tracker is not None:
+                started = time.perf_counter()
+                tracked = tracker.track_frame(inference_frame)
+                latency_ms = (time.perf_counter() - started) * 1000
+                detections = tracked["tracks"]
+                result = {
+                    **tracked,
+                    "detections": detections,
+                    "track_count": len(detections),
+                    "latency_ms": latency_ms,
+                }
+            else:
+                result = detector.detect(inference_frame)
+                result["track_count"] = 0
 
-        result = detector.detect(frame)
-        result["frame_index"] = frame_idx
-        result["timestamp_s"] = frame_idx / fps
-        results_list.append(result)
+            result["frame_index"] = frame_idx
+            result["timestamp_s"] = frame_idx / fps
+            result["source_width"] = width
+            result["source_height"] = height
+            results_list.append(result)
 
+            if writer:
+                writer.write(result["frame_annot"])
+
+            analysed += 1
+            if progress_callback:
+                progress_callback(analysed, expected)
+            if max_frames is not None and analysed >= max_frames:
+                break
+    finally:
+        cap.release()
         if writer:
-            writer.write(result["frame_annot"])
+            writer.release()
 
-        analysed += 1
-        if max_frames and analysed >= max_frames:
-            break
-
-    cap.release()
-    if writer:
-        writer.release()
-
+    latencies = [result["latency_ms"] for result in results_list]
+    avg_latency = float(np.mean(latencies)) if latencies else 0.0
     logger.info(f"Processed {analysed} frames from {Path(video_path).name} "
-                f"(avg latency {detector.avg_latency_ms:.1f} ms)")
+                f"(avg latency {avg_latency:.1f} ms)")
     return results_list
