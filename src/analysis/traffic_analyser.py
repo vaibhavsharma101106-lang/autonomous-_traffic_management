@@ -97,10 +97,16 @@ class TrafficAnalyser:
 
         self.roi_config = roi_config or CONFIG["analysis"].get("roi_default", {})
         self.db_conn    = db_conn
-        self.memory     = MemoryBuffer(maxlen=history_window)
+        self._history_window = history_window
+        self.memory     = MemoryBuffer(maxlen=self._history_window)
         self._roi_areas = self._compute_roi_areas()
         self._state_history: List[Dict] = []
         logger.info(f"TrafficAnalyser initialised — lanes: {list(self.roi_config)}")
+
+    def reset_session(self) -> None:
+        """Drop in-memory history so independent uploads cannot affect metrics."""
+        self.memory = MemoryBuffer(maxlen=self._history_window)
+        self._state_history.clear()
 
     # ── ROI area calculation ───────────────────────────────────────────────
     def _compute_roi_areas(self) -> Dict[str, float]:
@@ -117,7 +123,10 @@ class TrafficAnalyser:
                 timestamp: Optional[str] = None,
                 source: str = "video",
                 track_positions: Optional[Dict[int, Tuple[int, int]]] = None,
-                analysis_job_id: Optional[str] = None) -> Dict[str, Any]:
+                analysis_job_id: Optional[str] = None,
+                arrival_counts: Optional[Dict[str, int]] = None,
+                lane_class_totals: Optional[Dict[str, Dict[str, int]]] = None,
+                tracking_enabled: bool = False) -> Dict[str, Any]:
         """
         Compute full traffic metrics for the current frame/step.
 
@@ -135,6 +144,10 @@ class TrafficAnalyser:
             timestamp = datetime.now().isoformat()
         if class_totals is None:
             class_totals = {}
+        if arrival_counts is None:
+            arrival_counts = {}
+        if lane_class_totals is None:
+            lane_class_totals = {}
 
         lane_metrics: Dict[str, Dict] = {}
 
@@ -143,6 +156,7 @@ class TrafficAnalyser:
             queue_len_m  = self._estimate_queue_length(count)
             state        = classify_traffic_state(count)
             avg_speed    = self._estimate_speed(lane_id)
+            lane_classes = lane_class_totals.get(lane_id, class_totals)
 
             metric = {
                 "timestamp":     timestamp,
@@ -150,14 +164,16 @@ class TrafficAnalyser:
                 "analysis_job_id": analysis_job_id,
                 "lane_id":       lane_id,
                 "vehicle_count": count,
+                "arrival_count": int(arrival_counts.get(lane_id, 0)),
+                "tracking_enabled": bool(tracking_enabled),
                 "density":       round(density, 4),
                 "queue_length":  round(queue_len_m, 2),
                 "traffic_state": state,
                 "avg_speed":     round(avg_speed, 2),
-                "cars":          class_totals.get("car", 0),
-                "buses":         class_totals.get("bus", 0),
-                "trucks":        class_totals.get("truck", 0),
-                "motorcycles":   class_totals.get("motorcycle", 0),
+                "cars":          lane_classes.get("car", 0),
+                "buses":         lane_classes.get("bus", 0),
+                "trucks":        lane_classes.get("truck", 0),
+                "motorcycles":   lane_classes.get("motorcycle", 0),
                 "state_color":   state_to_color_hex(state),
             }
             lane_metrics[lane_id] = metric

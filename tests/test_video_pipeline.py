@@ -9,7 +9,8 @@ import cv2
 import numpy as np
 
 from src.detection.detector import process_video_frames, validate_video_file
-from src.utils import create_analysis_job, get_analysis_job, get_analysis_jobs, init_database, update_analysis_job
+from src.analysis.traffic_analyser import TrafficAnalyser
+from src.utils import create_analysis_job, get_analysis_job, get_analysis_jobs, get_traffic_history, init_database, update_analysis_job
 
 
 class FakeDetector:
@@ -21,10 +22,15 @@ class FakeDetector:
 class FakeTracker:
     def __init__(self):
         self.frames = 0
+        self.reset_called = False
+
+    def reset_for_video(self):
+        self.frames = 0
+        self.reset_called = True
 
     def track_frame(self, frame):
         self.frames += 1
-        return {"tracks": [{"track_id": self.frames, "class_name": "car"}],
+        return {"tracks": [{"track_id": 7, "class_name": "car", "lanes": ["lane1"]}],
                 "lane_counts": {"lane1": 1}, "class_totals": {"car": 1},
                 "frame_annot": frame.copy()}
 
@@ -58,7 +64,10 @@ class VideoPipelineTests(unittest.TestCase):
             results = process_video_frames(str(source), FakeDetector(), sample_rate=1,
                 max_frames=2, output_path=str(output), tracker=tracker)
             self.assertEqual(tracker.frames, 2)
-            self.assertEqual(results[0]["detections"][0]["track_id"], 1)
+            self.assertTrue(tracker.reset_called)
+            self.assertEqual(results[0]["detections"][0]["track_id"], 7)
+            self.assertEqual([r["arrivals_by_lane"]["lane1"] for r in results], [1, 0])
+            self.assertEqual(results[-1]["unique_track_count"], 1)
             cap = cv2.VideoCapture(str(output))
             try:
                 readable, frame = cap.read()
@@ -83,6 +92,44 @@ class VideoPipelineTests(unittest.TestCase):
                 validate_video_file(str(source), max_size_bytes=1)
             with self.assertRaises(ValueError):
                 validate_video_file(str(Path(directory) / "bad.txt"))
+
+    def test_video_time_and_lane_arrivals_are_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = init_database(str(Path(directory) / "observations.sqlite"))
+            analyser = TrafficAnalyser(db_conn=db)
+            timestamp = "2026-10-02T12:00:05"
+            analyser.analyse({"lane1": 2}, {"car": 2}, timestamp=timestamp,
+                             analysis_job_id="job-video", arrival_counts={"lane1": 1},
+                             lane_class_totals={"lane1": {"car": 1}}, tracking_enabled=True)
+            history = get_traffic_history(db, source="video")
+            self.assertEqual(len(history), 1)
+            self.assertEqual(history.iloc[0]["timestamp"], timestamp)
+            self.assertEqual(history.iloc[0]["analysis_job_id"], "job-video")
+            self.assertEqual(int(history.iloc[0]["arrival_count"]), 1)
+            self.assertEqual(int(history.iloc[0]["cars"]), 1)
+            self.assertTrue(bool(history.iloc[0]["tracking_enabled"]))
+            db.close()
+
+    def test_existing_database_gets_analytics_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            legacy_path = Path(directory) / "legacy.sqlite"
+            legacy = sqlite3.connect(legacy_path)
+            legacy.execute("""CREATE TABLE traffic_observations (
+                id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, source TEXT NOT NULL,
+                lane_id TEXT NOT NULL, vehicle_count INTEGER NOT NULL DEFAULT 0,
+                density REAL NOT NULL DEFAULT 0, queue_length REAL NOT NULL DEFAULT 0,
+                traffic_state TEXT NOT NULL DEFAULT 'FREE', cars INTEGER DEFAULT 0,
+                buses INTEGER DEFAULT 0, trucks INTEGER DEFAULT 0,
+                motorcycles INTEGER DEFAULT 0, avg_speed REAL DEFAULT 0
+            )""")
+            legacy.commit()
+            legacy.close()
+            db = init_database(str(legacy_path))
+            columns = {row[1] for row in db.execute("PRAGMA table_info(traffic_observations)")}
+            self.assertIn("analysis_job_id", columns)
+            self.assertIn("arrival_count", columns)
+            self.assertIn("tracking_enabled", columns)
+            db.close()
 
 
 if __name__ == "__main__":

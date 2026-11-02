@@ -55,6 +55,7 @@ class VehicleTracker:
         self.confidence = confidence or cfg["confidence"]
         self.imgsz = int(imgsz or cfg.get("imgsz", 640))
         self.max_trail  = max_trail
+        self.tracker_config_path = str(PROJECT_ROOT / "config" / "bytetrack.yaml")
 
         # Device
         import torch
@@ -109,7 +110,7 @@ class VehicleTracker:
             iou=CONFIG["detection"]["iou"],
             imgsz=self.imgsz,
             classes=list(self.vehicle_classes.keys()),
-            tracker="bytetrack.yaml",
+            tracker=self.tracker_config_path,
             verbose=False,
             device=self.device,
         )
@@ -236,6 +237,19 @@ class VehicleTracker:
             self.seen_ids[lane].clear()
         self.active_tracks.clear()
         logger.info("Tracker counters reset.")
+
+    def reset_for_video(self):
+        """Clear all temporal state before tracking a different uploaded video."""
+        self.reset_counts()
+        self.track_history.clear()
+        predictor = getattr(self.model, "predictor", None)
+        if predictor is not None:
+            # Ultralytics is called with persist=True so its callback would
+            # otherwise carry IDs and trajectories into the next upload.
+            for attribute in ("trackers", "vid_path"):
+                if hasattr(predictor, attribute):
+                    delattr(predictor, attribute)
+        logger.info("ByteTrack state reset for new video.")
 
     def get_trajectory(self, track_id: int) -> List[Tuple[int, int]]:
         """Return the trajectory history for a given track ID."""

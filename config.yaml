@@ -18,7 +18,7 @@ paths:
 
 detection:
   model: yolo11n.pt
-  confidence: 0.45
+  confidence: 0.25
   iou: 0.50
   device: auto          # 'auto' selects CUDA if available
   # COCO classes: 2=car, 3=motorcycle, 5=bus, 7=truck
@@ -40,8 +40,10 @@ tracking:
 analysis:
   frame_sample_rate: 5         # Process every Nth frame
   roi_default:
-    lane1: [[50, 280], [530, 280], [530, 480], [50, 480]]
-    lane2: [[530, 280], [1010, 280], [1010, 480], [530, 480]]
+    # Starter polygons are displayed over video resized to a 1280-pixel long edge.
+    # Tune these per recording in the upload page for reliable lane assignment.
+    lane1: [[50, 160], [530, 160], [530, 500], [50, 500]]
+    lane2: [[530, 160], [1010, 160], [1010, 500], [530, 500]]
   density_thresholds:
     free: 5
     moderate: 15

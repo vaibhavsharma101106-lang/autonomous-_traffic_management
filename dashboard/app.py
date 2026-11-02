@@ -24,7 +24,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -38,13 +37,9 @@ sys.path.insert(0, str(ROOT))
 from src.utils import (
     CONFIG, init_database, get_traffic_history, create_analysis_job,
     update_analysis_job, get_analysis_jobs, get_analysis_job,
-    classify_traffic_state, state_to_color_hex, insert_traffic_observation,
+    classify_traffic_state, state_to_color_hex,
 )
 from src.analysis.traffic_analyser import generate_synthetic_time_series, TrafficAnalyser
-from src.prediction.predictor import (
-    XGBoostPredictor, LSTMPredictor, RandomForestPredictor,
-    train_all_models, compare_models, evaluate_model,
-)
 from src.optimization.signal_controller import (
     FixedTimeController, RuleBasedController, AIAdaptiveController,
     LaneState, run_controller_comparison,
@@ -101,15 +96,9 @@ def get_analyser():
 
 
 @st.cache_data(ttl=30)
-def load_traffic_history(lane_id=None, limit=500):
+def load_traffic_history(lane_id=None, limit=500, source=None):
     db = get_db()
-    return get_traffic_history(db, lane_id=lane_id, limit=limit)
-
-
-@st.cache_resource
-def get_models():
-    """Load or train prediction models (cached for session)."""
-    return {"xgb": None, "lstm": None, "rf": None, "trained": False}
+    return get_traffic_history(db, lane_id=lane_id, limit=limit, source=source)
 
 
 @st.cache_resource(show_spinner="Loading YOLO11n weights (first run may download them)...")
@@ -126,17 +115,6 @@ def get_vehicle_tracker(confidence=0.45, imgsz=640, roi_json="{}"):
     from src.tracking.tracker import VehicleTracker
     return VehicleTracker(confidence=confidence, imgsz=imgsz,
                           roi_config=json.loads(roi_json) or None)
-
-
-def _ensure_synthetic_data():
-    """Generate synthetic data if DB is empty."""
-    db  = get_db()
-    df  = get_traffic_history(db, limit=10)
-    if df.empty:
-        synth = generate_synthetic_time_series(n_hours=48, seed=42)
-        for _, row in synth.iterrows():
-            insert_traffic_observation(db, row.to_dict())
-        st.cache_data.clear()
 
 
 def _state_badge(state: str) -> str:
@@ -182,8 +160,7 @@ if page == PAGES[0]:
                 unsafe_allow_html=True)
 
     # KPI Cards
-    _ensure_synthetic_data()
-    df_all = load_traffic_history(limit=200)
+    df_all = load_traffic_history(limit=200, source="video")
 
     col1, col2, col3, col4 = st.columns(4)
     total_veh = int(df_all["vehicle_count"].sum()) if not df_all.empty else 0
@@ -195,6 +172,8 @@ if page == PAGES[0]:
     col2.metric("🚗 Total Vehicles Counted", f"{total_veh:,}")
     col3.metric("📈 Avg. Density", f"{avg_dens:.1f}%")
     col4.metric("🔴 Latest State", latest_state)
+    if df_all.empty:
+        st.info("No recorded-video observations yet. Upload a recording in Video Analysis to populate these metrics. Synthetic examples are not stored as traffic observations.")
 
     st.markdown("---")
 
@@ -284,7 +263,7 @@ elif page == PAGES[1]:
     sample_rate = sample_rate.slider("Frame sample interval", 1, 30, 5)
     max_frames = max_frames.slider("Maximum sampled frames", 1, 500, 100)
     enable_track = enable_track.checkbox("Enable ByteTrack", value=True)
-    confidence = st.slider("Detection confidence", 0.05, 0.95, 0.45, 0.05)
+    confidence = st.slider("Detection confidence", 0.05, 0.95, 0.25, 0.05)
     inference_size = st.select_slider("Model input size", options=[320, 480, 640, 960, 1280], value=640)
     default_roi_json = json.dumps(CONFIG["analysis"].get("roi_default", {}), indent=2)
     roi_text = st.text_area("Lane ROI polygons (JSON coordinates in the resized video frame)",
@@ -344,37 +323,64 @@ elif page == PAGES[1]:
                     tracker = get_vehicle_tracker(confidence, inference_size, roi_json) if enable_track else None
                     detector.reset_stats()
                     analyser = get_analyser()
+                    analyser.reset_session()
                     analysed_lane_series, totals = {}, {}
                     def on_progress(done, expected):
                         progress.progress(min(done / max(expected, 1), 1.0), text=f"Analyzed {done} of up to {expected} sampled frames")
+                    process_started = time.perf_counter()
                     results = process_video_frames(str(job["video_path"]), detector,
                         sample_rate=sample_rate, max_frames=max_frames,
                         output_path=str(output_path), tracker=tracker,
                         max_inference_dim=1280, progress_callback=on_progress)
+                    processing_seconds = max(time.perf_counter() - process_started, 1e-9)
                     detection_count = tracking_count = 0
+                    unique_track_ids = set()
+                    job_start = datetime.fromisoformat(job["created_at"])
                     for result in results:
                         detections = result.get("detections", [])
                         detection_count += len(detections)
                         tracking_count += result.get("track_count", 0)
+                        unique_track_ids.update(int(track["track_id"]) for track in detections if "track_id" in track)
+                        observed_at = (job_start + timedelta(seconds=result["timestamp_s"])).isoformat()
                         analysis = analyser.analyse(result["lane_counts"], result["class_totals"],
-                                                    source="video", analysis_job_id=job_id)
+                                                    timestamp=observed_at, source="video",
+                                                    analysis_job_id=job_id,
+                                                    arrival_counts=result.get("arrivals_by_lane") or {},
+                                                    lane_class_totals=result.get("lane_class_totals") or {},
+                                                    tracking_enabled=bool(tracker))
                         for lane, metric in analysis["lane_metrics"].items():
-                            analysed_lane_series.setdefault(lane, []).append({"timestamp_s": result["timestamp_s"], "count": metric["vehicle_count"]})
+                            analysed_lane_series.setdefault(lane, []).append({
+                                "video_time_s": result["timestamp_s"],
+                                "vehicle_count": metric["vehicle_count"],
+                                "vehicle_arrivals": metric["arrival_count"],
+                            })
                         for cls, count in result["class_totals"].items():
                             totals[cls] = totals.get(cls, 0) + int(count)
                     metrics = {"frames": len(results), "mean_latency_ms": detector.avg_latency_ms,
                                "mean_sampled_vehicles_per_frame": detection_count / max(len(results), 1),
-                               "tracking_enabled": bool(tracker)}
+                               "processing_fps": len(results) / processing_seconds,
+                               "tracking_enabled": bool(tracker),
+                               "unique_track_ids": len(unique_track_ids),
+                               "vehicle_arrivals_by_lane": {
+                                   lane: int(sum(point["vehicle_arrivals"] for point in series))
+                                   for lane, series in analysed_lane_series.items()
+                               }}
                     update_analysis_job(get_db(), job_id, status="completed", processed_frames=len(results),
                                         detection_count=detection_count, tracking_count=tracking_count,
                                         class_totals_json=totals, metrics_json=metrics)
+                    st.cache_data.clear()
                     progress.progress(1.0, text="Analysis complete")
                     if results:
                         st.video(str(output_path))
-                        st.success(f"Processed {len(results)} sampled frames. Vehicles detected: {detection_count}; tracked: {tracking_count}.")
-                        st.json({"vehicle_classes": totals, "metrics": metrics})
+                        st.success(f"Processed {len(results)} sampled frames. Detection instances: {detection_count}; track observations: {tracking_count}; unique track IDs: {len(unique_track_ids)}.")
+                        if not tracker:
+                            st.caption("Arrival counts require ByteTrack and are unavailable for this run.")
+                        st.json({"class_detection_instances": totals, "metrics": metrics})
                         for lane, series in analysed_lane_series.items():
-                            st.plotly_chart(px.line(pd.DataFrame(series), x="timestamp_s", y="count", title=f"{lane} — vehicles per sampled frame"), use_container_width=True)
+                            lane_df = pd.DataFrame(series)
+                            st.plotly_chart(px.line(lane_df, x="video_time_s", y="vehicle_count", title=f"{lane} — vehicles in sampled frame"), use_container_width=True)
+                            if tracker:
+                                st.plotly_chart(px.bar(lane_df, x="video_time_s", y="vehicle_arrivals", title=f"{lane} — newly observed tracked vehicles"), use_container_width=True)
                     else:
                         st.warning("No frames were processed. Check the video decoder and sample settings.")
                 except Exception as exc:
@@ -397,21 +403,22 @@ elif page == PAGES[1]:
 # ═════════════════════════════════════════════════════════════════════════════
 elif page == PAGES[2]:
     st.markdown("## 📊 Traffic Monitoring")
-    _ensure_synthetic_data()
-
     refresh = st.checkbox("Auto-refresh every 5 seconds", value=False)
 
-    df = load_traffic_history(limit=300)
+    df = load_traffic_history(limit=300, source="video")
     if df.empty:
-        st.warning("No data. Generating synthetic data...")
-        synth = generate_synthetic_time_series(n_hours=24, seed=42)
-        df    = synth
+        st.info("No recorded-video traffic observations yet. Upload and analyze a recording to see lane metrics here.")
+        st.stop()
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.sort_values("timestamp")
+    st.caption("Source: recorded traffic video. Synthetic/demo rows are excluded.")
 
     # Lane filter
     lanes_avail = df["lane_id"].unique().tolist()
     sel_lanes   = st.multiselect("Filter Lanes", lanes_avail, default=lanes_avail)
+    if not sel_lanes:
+        st.info("Select at least one lane to display metrics.")
+        st.stop()
     df_filt     = df[df["lane_id"].isin(sel_lanes)]
 
     # KPI metrics per lane
@@ -429,6 +436,7 @@ elif page == PAGES[2]:
                         <h4>{lane.upper()}</h4>
                         <div style="color:{color};font-size:1.4rem;font-weight:bold;">{state}</div>
                         <div>🚗 {int(latest['vehicle_count'])} vehicles</div>
+                        <div>➕ {int(latest.get('arrival_count', 0)) if bool(latest.get('tracking_enabled', 0)) else 'Unavailable'} new tracked arrivals</div>
                         <div>📏 Queue: {latest['queue_length']:.0f} m</div>
                         <div>💨 Density: {latest['density']*100:.0f}%</div>
                     </div>
@@ -502,132 +510,16 @@ elif page == PAGES[2]:
 # ═════════════════════════════════════════════════════════════════════════════
 elif page == PAGES[3]:
     st.markdown("## 🔮 Congestion Prediction")
-    st.markdown("""
-    Predicts lane traffic demand **5 minutes ahead** using Random Forest,
-    XGBoost, and LSTM models trained on historical observations.
-    """)
+    st.caption("Forecast horizon planned: approximately 60 seconds. Predictions are unavailable until the traffic-arrival training and evaluation pipeline is completed.")
+    real_rows = get_traffic_history(get_db(), source="video", limit=20000)
+    lane_count = real_rows["lane_id"].nunique() if not real_rows.empty else 0
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Recorded-video observations", f"{len(real_rows):,}")
+    col2.metric("Lanes represented", f"{lane_count}")
+    col3.metric("Model status", "Not trained")
+    st.warning("No forecast is being shown. The existing legacy model code has not been validated for the required 60-second lane-arrival target, so it is not used here.")
+    st.info("The next ML phase will prepare per-lane arrival features, split recordings chronologically, train XGBoost with persistence and Random Forest baselines, and store provenance and holdout metrics before enabling inference.")
 
-    _ensure_synthetic_data()
-    models_state = get_models()
-
-    col_a, col_b = st.columns([2, 1])
-    with col_b:
-        st.subheader("Model Training")
-        n_hours_train = st.slider("Training data (hours)", 12, 168, 72)
-        if st.button("🏋️ Train All Models", type="primary"):
-            with st.spinner("Training RF, XGBoost, and LSTM models..."):
-                try:
-                    db  = get_db()
-                    df  = get_traffic_history(db, limit=20000)
-                    if len(df) < 100:
-                        df = generate_synthetic_time_series(n_hours=n_hours_train, seed=42)
-
-                    df_lane = df[df["lane_id"] == "lane1"].reset_index(drop=True)
-                    n  = len(df_lane)
-                    n_tr = int(n * 0.70)
-                    n_va = int(n * 0.15)
-                    train_df = df_lane.iloc[:n_tr]
-                    val_df   = df_lane.iloc[n_tr:n_tr+n_va]
-                    test_df  = df_lane.iloc[n_tr+n_va:]
-
-                    results = train_all_models(train_df, val_df, test_df)
-                    st.session_state["trained_models"] = results
-                    st.session_state["test_df"]        = test_df
-                    st.success("✅ All models trained!")
-
-                except Exception as e:
-                    st.error(f"Training failed: {e}")
-
-    with col_a:
-        st.subheader("Model Comparison (Test Set)")
-        if "trained_models" in st.session_state:
-            comp = st.session_state["trained_models"].get("test_comparison")
-            if comp is not None and not comp.empty:
-                st.dataframe(
-                    comp.style.format("{:.4f}").highlight_min(
-                        subset=["mae", "rmse"], color="#1a472a"
-                    ).highlight_max(
-                        subset=["r2"], color="#1a472a"
-                    ),
-                    use_container_width=True
-                )
-
-                fig_bar = px.bar(
-                    comp.reset_index(), x="model",
-                    y=["mae", "rmse"],
-                    barmode="group", title="MAE and RMSE by Model",
-                    color_discrete_map={"mae": "#1f77b4", "rmse": "#ff7f0e"}
-                )
-                fig_bar.update_layout(height=280)
-                st.plotly_chart(fig_bar, use_container_width=True)
-        else:
-            st.info("Click 'Train All Models' to generate comparison metrics.")
-
-    st.markdown("---")
-    st.subheader("Forecast Visualisation")
-
-    if "trained_models" in st.session_state and "test_df" in st.session_state:
-        results   = st.session_state["trained_models"]
-        test_df   = st.session_state["test_df"]
-        y_true    = test_df["vehicle_count"].values
-
-        model_choice = st.selectbox("Select Model",
-                                     ["XGBoost", "RandomForest", "LSTM"])
-        model_key    = {"XGBoost": "XGBoost",
-                         "RandomForest": "RandomForest",
-                         "LSTM": "LSTM"}[model_choice]
-
-        try:
-            mdl      = results[model_key]["model"]
-            y_pred   = mdl.predict(test_df.copy())
-            n        = min(len(y_true), len(y_pred), 200)
-
-            fig_fc = go.Figure()
-            fig_fc.add_trace(go.Scatter(
-                y=y_true[:n], name="Actual",
-                line=dict(color="#1f77b4"), mode="lines"
-            ))
-            fig_fc.add_trace(go.Scatter(
-                y=y_pred[:n], name="Predicted",
-                line=dict(color="#ff7f0e", dash="dash"), mode="lines"
-            ))
-            fig_fc.update_layout(
-                title=f"{model_choice} — Actual vs. Predicted Vehicle Count",
-                xaxis_title="Time Step", yaxis_title="Vehicles",
-                height=380, hovermode="x unified"
-            )
-            st.plotly_chart(fig_fc, use_container_width=True)
-
-            # Error distribution
-            errors = y_true[:n] - y_pred[:n]
-            fig_err = px.histogram(errors, nbins=30,
-                                    title="Prediction Error Distribution",
-                                    labels={"value": "Error (vehicles)"},
-                                    color_discrete_sequence=["#9467bd"])
-            fig_err.update_layout(height=240)
-            st.plotly_chart(fig_err, use_container_width=True)
-
-        except Exception as e:
-            st.error(f"Prediction visualisation failed: {e}")
-    else:
-        # Show demo forecast
-        st.info("Train models above to see actual forecast. Showing demo:")
-        np.random.seed(7)
-        t    = np.arange(60)
-        true = 10 + 5 * np.sin(t / 5) + np.random.normal(0, 1.5, 60)
-        pred = true + np.random.normal(0, 2, 60)
-        fig_demo = go.Figure()
-        fig_demo.add_trace(go.Scatter(y=true, name="Actual", line=dict(color="#1f77b4")))
-        fig_demo.add_trace(go.Scatter(y=pred, name="Predicted (demo)",
-                                       line=dict(color="#ff7f0e", dash="dash")))
-        fig_demo.update_layout(title="Demo Forecast (Train models for real results)",
-                                height=300)
-        st.plotly_chart(fig_demo, use_container_width=True)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# PAGE 5: SIGNAL OPTIMIZATION
-# ═════════════════════════════════════════════════════════════════════════════
 elif page == PAGES[4]:
     st.markdown("## 🚦 Adaptive Signal Optimization")
     st.markdown("""

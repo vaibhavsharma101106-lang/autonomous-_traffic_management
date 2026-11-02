@@ -364,6 +364,8 @@ def process_video_frames(video_path: str,
         raise ValueError("Maximum frame count must be at least 1 when provided.")
     if max_inference_dim < 320:
         raise ValueError("Inference frame size must be at least 320 pixels.")
+    if tracker is not None and hasattr(tracker, "reset_for_video"):
+        tracker.reset_for_video()
     metadata = validate_video_file(video_path)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -392,6 +394,7 @@ def process_video_frames(video_path: str,
 
     results_list: List[Dict] = []
     frame_idx, analysed = 0, 0
+    seen_track_ids: Dict[str, set] = {}
     try:
         while True:
             ret, frame = cap.read()
@@ -403,7 +406,9 @@ def process_video_frames(video_path: str,
                 continue
 
             inference_frame = (
-                cv2.resize(frame, (output_width, output_height), interpolation=cv2.INTER_AREA)
+                # Linear interpolation preserves small vehicle edges better
+                # than area averaging on 4K-to-720p traffic footage.
+                cv2.resize(frame, (output_width, output_height), interpolation=cv2.INTER_LINEAR)
                 if scale < 1.0 else frame
             )
             if tracker is not None:
@@ -411,20 +416,39 @@ def process_video_frames(video_path: str,
                 tracked = tracker.track_frame(inference_frame)
                 latency_ms = (time.perf_counter() - started) * 1000
                 detections = tracked["tracks"]
+                arrivals_by_lane = {lane: 0 for lane in tracked["lane_counts"]}
+                for track in detections:
+                    track_id = int(track["track_id"])
+                    for lane in track.get("lanes", []):
+                        known = seen_track_ids.setdefault(lane, set())
+                        if track_id not in known:
+                            arrivals_by_lane[lane] = arrivals_by_lane.get(lane, 0) + 1
+                            known.add(track_id)
                 result = {
                     **tracked,
                     "detections": detections,
                     "track_count": len(detections),
+                    "arrivals_by_lane": arrivals_by_lane,
+                    "unique_track_count": len({int(track["track_id"]) for track in detections}),
                     "latency_ms": latency_ms,
                 }
             else:
                 result = detector.detect(inference_frame)
                 result["track_count"] = 0
+                result["arrivals_by_lane"] = None
+                result["unique_track_count"] = 0
 
             result["frame_index"] = frame_idx
             result["timestamp_s"] = frame_idx / fps
             result["source_width"] = width
             result["source_height"] = height
+            lane_class_totals = {lane: {} for lane in result.get("lane_counts", {})}
+            for detection in result.get("detections", []):
+                for lane in detection.get("lanes", []):
+                    counts = lane_class_totals.setdefault(lane, {})
+                    name = detection["class_name"]
+                    counts[name] = counts.get(name, 0) + 1
+            result["lane_class_totals"] = lane_class_totals
             results_list.append(result)
 
             if writer:

@@ -113,6 +113,8 @@ def init_database(db_path: Optional[str] = None) -> sqlite3.Connection:
             source          TEXT    NOT NULL DEFAULT 'video',
             lane_id         TEXT    NOT NULL,
             vehicle_count   INTEGER NOT NULL DEFAULT 0,
+            arrival_count   INTEGER NOT NULL DEFAULT 0,
+            tracking_enabled INTEGER NOT NULL DEFAULT 0,
             density         REAL    NOT NULL DEFAULT 0.0,
             queue_length    REAL    NOT NULL DEFAULT 0.0,
             traffic_state   TEXT    NOT NULL DEFAULT 'FREE',
@@ -194,6 +196,10 @@ def init_database(db_path: Optional[str] = None) -> sqlite3.Connection:
     }
     if "analysis_job_id" not in observation_columns:
         cur.execute("ALTER TABLE traffic_observations ADD COLUMN analysis_job_id TEXT")
+    if "arrival_count" not in observation_columns:
+        cur.execute("ALTER TABLE traffic_observations ADD COLUMN arrival_count INTEGER NOT NULL DEFAULT 0")
+    if "tracking_enabled" not in observation_columns:
+        cur.execute("ALTER TABLE traffic_observations ADD COLUMN tracking_enabled INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     return conn
 
@@ -204,15 +210,17 @@ def insert_traffic_observation(conn: sqlite3.Connection,
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO traffic_observations
-        (analysis_job_id, timestamp, source, lane_id, vehicle_count, density, queue_length,
+        (analysis_job_id, timestamp, source, lane_id, vehicle_count, arrival_count, tracking_enabled, density, queue_length,
          traffic_state, cars, buses, trucks, motorcycles, avg_speed)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         data.get("analysis_job_id"),
         data.get("timestamp", datetime.now().isoformat()),
         data.get("source", "video"),
         data.get("lane_id", "lane1"),
         data.get("vehicle_count", 0),
+        data.get("arrival_count", 0),
+        int(bool(data.get("tracking_enabled", False))),
         data.get("density", 0.0),
         data.get("queue_length", 0.0),
         data.get("traffic_state", "FREE"),

@@ -1,0 +1,10 @@
+# ByteTrack configuration for sampled YOLO11n traffic video.
+# The lower start threshold allows low-confidence small vehicles to form tracks;
+# it does not change YOLO's confidence slider or establish detection accuracy.
+tracker_type: bytetrack
+track_high_thresh: 0.15
+track_low_thresh: 0.05
+new_track_thresh: 0.15
+track_buffer: 30
+match_thresh: 0.8
+fuse_score: true
