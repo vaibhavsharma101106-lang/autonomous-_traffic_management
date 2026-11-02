@@ -42,6 +42,48 @@ CLASS_COLORS_BGR: Dict[str, Tuple[int, int, int]] = {
 }
 
 
+def resolve_model_weights(model_path: Optional[str] = None) -> Path:
+    """Resolve YOLO weights from the project root, independent of cwd."""
+    configured_path = Path(model_path or CONFIG["detection"]["model"]).expanduser()
+    if configured_path.is_absolute():
+        return configured_path.resolve()
+
+    # Bare model names use the shared, predictable weights directory. Explicit
+    # relative paths in config remain relative to the project root.
+    if model_path is None and len(configured_path.parts) == 1:
+        configured_path = Path("models") / "weights" / configured_path
+    elif model_path is not None and len(configured_path.parts) == 1:
+        configured_path = Path("models") / "weights" / configured_path
+    return (PROJECT_ROOT / configured_path).resolve()
+
+
+def load_yolo_model(model_path: Optional[str] = None):
+    """Load the official YOLO model, letting Ultralytics fetch missing weights."""
+    weights_path = resolve_model_weights(model_path)
+    weights_path.parent.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Loading Ultralytics model weights: {weights_path}")
+
+    try:
+        # Ultralytics downloads known model assets on first use. Passing the
+        # project-root path makes that download persistent and predictable.
+        model = YOLO(str(weights_path))
+        if not weights_path.is_file():
+            checkpoint = Path(getattr(model, "ckpt_path", ""))
+            if checkpoint.is_file() and checkpoint.resolve() != weights_path:
+                import shutil
+                shutil.copy2(checkpoint, weights_path)
+        if not weights_path.is_file():
+            raise FileNotFoundError(f"Ultralytics loaded the model without saving weights to {weights_path}")
+        return model
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not load YOLO weights at {weights_path}. Ultralytics could not "
+            "load the local file or download the official model. Check the internet "
+            "connection and that the installed Ultralytics version supports YOLO11. "
+            f"Original error: {exc}"
+        ) from exc
+
+
 class VehicleDetector:
     """
     YOLO11n vehicle detector with selective-attention ROI filtering.
@@ -75,26 +117,8 @@ class VehicleDetector:
         else:
             self.device = raw_device
 
-        # Load YOLO model
-        if model_path is None:
-            model_path = PROJECT_ROOT / "models" / "detection" / cfg["model"]
-        model_path = str(model_path)
-
-        logger.info(f"Loading YOLO model: {model_path} on {self.device}")
-        try:
-            self.model = YOLO(model_path)
-        except Exception:
-            # Fallback: download from ultralytics hub
-            logger.warning("Local weights not found — downloading yolo11n.pt")
-            self.model = YOLO("yolo11n.pt")
-            # Save to models directory for reuse
-            dest = PROJECT_ROOT / "models" / "detection" / "yolo11n.pt"
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            import shutil
-            src = Path(self.model.ckpt_path)
-            if src.exists() and not dest.exists():
-                shutil.copy(str(src), str(dest))
-
+        logger.info(f"Loading YOLO model on {self.device}")
+        self.model = load_yolo_model(model_path)
         self.model.to(self.device)
         if self.half and self.device == "cuda":
             self.model.model.half()

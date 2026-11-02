@@ -314,6 +314,7 @@ def put_text_bg(frame: np.ndarray, text: str,
                 bg_color: Tuple[int, int, int] = (0, 0, 0),
                 thickness: int = 1) -> np.ndarray:
     """Draw text with a filled background rectangle for readability."""
+    import cv2
     font = cv2.FONT_HERSHEY_SIMPLEX
     (tw, th), bl = cv2.getTextSize(text, font, font_scale, thickness)
     x, y = org

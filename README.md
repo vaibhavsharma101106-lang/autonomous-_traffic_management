@@ -17,7 +17,7 @@ python -m pip install --upgrade pip
 python -m pip install --only-binary=:all: -r requirements.txt
 ```
 
-The requirements file includes PyTorch, Ultralytics, OpenCV, Streamlit, FastAPI, and the prediction and document libraries. GPU use is optional; CPU mode is selected when CUDA is unavailable. Place compatible `yolo11n.pt` weights at `models/detection/yolo11n.pt` before running video analysis. Model weights are not included. SUMO and TraCI are optional and must be installed separately; the evaluated experiment results below use the built-in software simulator.
+The requirements file includes PyTorch, Ultralytics, OpenCV, Streamlit, FastAPI, and the prediction and document libraries. GPU use is optional; CPU mode is selected when CUDA is unavailable. The first video-analysis run automatically downloads the official YOLO11n weights to `models/weights/yolo11n.pt` when internet access is available. SUMO and TraCI are optional and must be installed separately; the evaluated experiment results below use the built-in software simulator.
 
 ## Run the application
 
@@ -48,7 +48,7 @@ docker run --rm -p 8501:8501 ai-traffic-management
 
 Then open `http://localhost:8501`. Set the `PORT` environment variable when the container platform assigns a different listening port. The container runs the dashboard; run the FastAPI service separately with the command below if you need the API.
 
-The dashboard can deploy without model weights, but recorded-video detection needs `models/detection/yolo11n.pt`. Model weights, private traffic video, local databases, and virtual environments are intentionally excluded from Git; supply weights and data through the deployment environment when needed.
+The dashboard can deploy without model weights; recorded-video detection downloads `models/weights/yolo11n.pt` on first use when internet access is available. Model weights, private traffic video, local databases, and virtual environments are intentionally excluded from Git.
 
 ## Run the software experiments
 

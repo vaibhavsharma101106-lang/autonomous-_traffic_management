@@ -20,8 +20,6 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 from loguru import logger
-from ultralytics import YOLO
-
 from src.utils import CONFIG, PROJECT_ROOT, is_point_in_roi, put_text_bg
 
 
@@ -63,14 +61,10 @@ class VehicleTracker:
             device_raw if device_raw != "auto" else "cpu"
         )
 
-        # Load YOLO model (reused for tracking)
-        if model_path is None:
-            model_path = PROJECT_ROOT / "models" / "detection" / cfg["model"]
-        try:
-            self.model = YOLO(str(model_path))
-        except Exception:
-            logger.warning("Tracker: local weights missing — downloading yolo11n.pt")
-            self.model = YOLO("yolo11n.pt")
+        # Use the same project-root weights and automatic Ultralytics download
+        # path as detection, so tracking works regardless of the launch cwd.
+        from src.detection.detector import load_yolo_model
+        self.model = load_yolo_model(model_path)
         self.model.to(self.device)
 
         # ROI configuration (selective attention filter)

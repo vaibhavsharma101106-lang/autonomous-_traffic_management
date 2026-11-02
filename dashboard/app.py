@@ -111,6 +111,20 @@ def get_models():
     return {"xgb": None, "lstm": None, "rf": None, "trained": False}
 
 
+@st.cache_resource(show_spinner="Loading YOLO11n weights (first run may download them)...")
+def get_vehicle_detector():
+    """Keep the expensive YOLO model loaded across Streamlit reruns."""
+    from src.detection.detector import VehicleDetector
+    return VehicleDetector()
+
+
+@st.cache_resource(show_spinner="Loading ByteTrack model...")
+def get_vehicle_tracker():
+    """Cache the tracking model so reruns do not reload its weights."""
+    from src.tracking.tracker import VehicleTracker
+    return VehicleTracker()
+
+
 def _ensure_synthetic_data():
     """Generate synthetic data if DB is empty."""
     db  = get_db()
@@ -268,6 +282,7 @@ elif page == PAGES[1]:
 
     if uploaded is not None:
         # Save uploaded video
+        (ROOT / "data" / "raw").mkdir(parents=True, exist_ok=True)
         tmpfile = tempfile.NamedTemporaryFile(
             delete=False, suffix=Path(uploaded.name).suffix, dir=str(ROOT / "data" / "raw")
         )
@@ -280,15 +295,15 @@ elif page == PAGES[1]:
         if st.button("🔍 Analyse Video", type="primary"):
             with st.spinner("Loading YOLO11n model and processing video..."):
                 try:
-                    from src.detection.detector import VehicleDetector, process_video_frames
-                    from src.tracking.tracker import VehicleTracker
+                    from src.detection.detector import process_video_frames
 
-                    detector = VehicleDetector()
+                    detector = get_vehicle_detector()
                     analyser = get_analyser()
 
                     if enable_track:
-                        tracker = VehicleTracker()
+                        tracker = get_vehicle_tracker()
 
+                    (ROOT / "data" / "processed").mkdir(parents=True, exist_ok=True)
                     output_path = str(ROOT / "data" / "processed" / "annotated_output.mp4")
                     results = process_video_frames(
                         video_path, detector,
@@ -299,6 +314,11 @@ elif page == PAGES[1]:
 
                     st.success(f"✅ Analysed {len(results)} frames | "
                                f"Avg latency: {detector.avg_latency_ms:.1f} ms")
+                    if results:
+                        detected_count = sum(len(frame.get("detections", [])) for frame in results)
+                        st.info(f"Annotated video saved with {detected_count} vehicle detections "
+                                f"to `{output_path}`.")
+                        st.video(output_path)
 
                     # Aggregate results
                     lane_series: Dict[str, List] = {}
@@ -358,7 +378,12 @@ elif page == PAGES[1]:
 
                 except Exception as e:
                     st.error(f"Detection failed: {e}")
-                    st.info("Make sure ultralytics is installed: pip install ultralytics")
+                    st.info(
+                        "The first run needs internet access to download the official "
+                        "YOLO11n weights. They are stored at "
+                        "`models/weights/yolo11n.pt`; verify the dependencies in "
+                        "`requirements.txt` if loading still fails."
+                    )
     else:
         # Demo with synthetic data
         st.info("👆 Upload a traffic video, or view the demo below using synthetic data.")

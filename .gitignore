@@ -15,6 +15,7 @@ data/processed/**
 data/synthetic/**
 data/traffic.db
 data/traffic.db-*
+models/weights/*.pt
 models/detection/*.pt
 models/**/*.pkl
 models/**/*.joblib
