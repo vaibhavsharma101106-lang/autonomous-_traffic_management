@@ -20,6 +20,7 @@ models/detection/*.pt
 models/**/*.pkl
 models/**/*.joblib
 models/**/*.pth
+models/traffic_arrival/**
 experiments/system.log
 experiments/results/**
 !submission/experiment_results/**

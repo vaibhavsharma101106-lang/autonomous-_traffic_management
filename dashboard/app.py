@@ -510,15 +510,72 @@ elif page == PAGES[2]:
 # ═════════════════════════════════════════════════════════════════════════════
 elif page == PAGES[3]:
     st.markdown("## 🔮 Congestion Prediction")
-    st.caption("Forecast horizon planned: approximately 60 seconds. Predictions are unavailable until the traffic-arrival training and evaluation pipeline is completed.")
+    st.caption("Forecast horizon: 60 seconds. Recorded-video forecasts are enabled only after a model passes the held-out persistence-baseline gate.")
     real_rows = get_traffic_history(get_db(), source="video", limit=20000)
     lane_count = real_rows["lane_id"].nunique() if not real_rows.empty else 0
+    recorded_model_dir = ROOT / "models" / "traffic_arrival" / "recorded_video"
+    recorded_metadata_path = recorded_model_dir / "metadata.json"
+    recorded_metadata = None
+    if recorded_metadata_path.is_file():
+        try:
+            recorded_metadata = json.loads(recorded_metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            st.error("Recorded-video model metadata could not be read. Model loading is disabled.")
     col1, col2, col3 = st.columns(3)
     col1.metric("Recorded-video observations", f"{len(real_rows):,}")
     col2.metric("Lanes represented", f"{lane_count}")
-    col3.metric("Model status", "Not trained")
-    st.warning("No forecast is being shown. The existing legacy model code has not been validated for the required 60-second lane-arrival target, so it is not used here.")
-    st.info("The next ML phase will prepare per-lane arrival features, split recordings chronologically, train XGBoost with persistence and Random Forest baselines, and store provenance and holdout metrics before enabling inference.")
+    status = (recorded_metadata or {}).get("status", "not_trained")
+    col3.metric("Recorded-video model", status.replace("_", " ").title())
+
+    pred_left, pred_right = st.columns(2)
+    with pred_left:
+        if st.button("Run synthetic benchmark", help="Trains a clearly labeled synthetic benchmark. It cannot be used for real-video inference."):
+            with st.spinner("Generating synthetic sessions and evaluating models..."):
+                try:
+                    from src.prediction.traffic_arrival import generate_synthetic_observations, train_arrival_model
+                    synthetic = generate_synthetic_observations(session_count=12, minutes_per_session=30, seed=42)
+                    result = train_arrival_model(synthetic, ROOT / "models" / "traffic_arrival" / "synthetic")
+                    st.session_state["synthetic_arrival_metrics"] = result
+                    st.success("Synthetic benchmark complete. This model is not enabled for recorded-video forecasts.")
+                except Exception as exc:
+                    st.error(f"Synthetic benchmark failed: {exc}")
+    with pred_right:
+        if st.button("Train from recorded videos", type="primary"):
+            with st.spinner("Preparing recording-level splits and evaluating the 60-second target..."):
+                try:
+                    from src.prediction.traffic_arrival import train_arrival_model
+                    result = train_arrival_model(real_rows, recorded_model_dir)
+                    st.session_state["recorded_arrival_metrics"] = result
+                    st.success(f"Recorded-video evaluation finished: {result['status']}.")
+                except Exception as exc:
+                    st.warning(f"Recorded-video model unavailable: {exc}")
+
+    for label, key in (("Synthetic benchmark (separate; not a real-traffic result)", "synthetic_arrival_metrics"),
+                       ("Recorded-video held-out evaluation", "recorded_arrival_metrics")):
+        result = st.session_state.get(key)
+        if result:
+            st.subheader(label)
+            st.caption(f"Source: {result['data_source']} · target: next {result['horizon_seconds']}s lane arrivals · split: {result['split']['method']}")
+            st.dataframe(pd.DataFrame(result["metrics"]).T, use_container_width=True)
+
+    if recorded_metadata and recorded_metadata.get("inference_ready"):
+        try:
+            from src.prediction.traffic_arrival import load_ready_arrival_model, predict_latest_arrivals
+            model, model_meta = load_ready_arrival_model(recorded_model_dir)
+            forecasts = predict_latest_arrivals(model, real_rows, model_meta)
+            if not forecasts.empty:
+                latest = forecasts.sort_values("last_observation_time").groupby("lane_id", as_index=False).tail(1)
+                st.subheader("Next 60-second lane-arrival estimate")
+                st.caption("Forecast from the latest analyzed recording window; this is not a live-traffic prediction.")
+                st.dataframe(latest, use_container_width=True)
+            else:
+                st.info("A model is ready, but there are not yet three tracked intervals for a forecast.")
+        except Exception as exc:
+            st.error(f"Recorded-video model inference failed: {exc}")
+    elif recorded_metadata:
+        st.warning("A recorded-video model was trained, but it did not pass the persistence-baseline readiness gate. No forecast is shown.")
+    else:
+        st.info("No real-video model is trained. Synthetic benchmark results remain separate and cannot unlock inference.")
 
 elif page == PAGES[4]:
     st.markdown("## 🚦 Adaptive Signal Optimization")

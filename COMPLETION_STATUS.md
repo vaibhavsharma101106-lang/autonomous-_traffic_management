@@ -40,6 +40,15 @@
 - The Prediction page no longer shows invented forecast curves or trains the legacy models on synthetic fallback data. It reports that a validated model is unavailable and identifies the planned ML workflow.
 - Added schema migration for existing SQLite databases and tests for the new arrival column, video timestamps, lane-specific class persistence, and per-lane unique arrivals.
 
+## Phase 3 traffic-arrival forecasting pipeline completed in this pass
+
+- Added a dataset builder for per-lane arrival counts over the next 60 seconds, using recent arrival lags, queue estimate, lane code, and time-of-day features. It requires tracked observations, keeps each uploaded video as a recording session, and drops incomplete forecast horizons.
+- Added recording-session chronological train/validation/test splits; the single-session fallback uses a chronological split with horizon-crossing labels purged.
+- Added XGBoost primary training, Random Forest and persistence baselines, holdout MAE/RMSE/R², feature and lane schema, training configuration, dataset hash, provenance, and saved model artifacts.
+- Added a separate reproducible synthetic-data generator and benchmark workflow. Synthetic artifacts cannot be loaded for recorded-video inference. Recorded-video inference is enabled only after a 30-sample minimum holdout, finite metrics, and XGBoost MAE no worse than persistence.
+- Added a Prediction page that can run and display the synthetic benchmark separately, train on eligible recorded jobs, show model status, and forecast only from an inference-ready recorded-video artifact.
+- Added tests for the 60-second target, horizon-purged splits, recording-level splits, inference feature construction, and synthetic artifact provenance and gating.
+
 ## Remaining work and known limitations
 
 - A real-video smoke run returned two unique track IDs and two lane arrivals. This is a functional smoke check only; it does not establish tracking accuracy or generalize to other camera views.
@@ -51,7 +60,7 @@
 
 - PDF/CSV traffic report generation and an explicit report download workflow.
 - Dedicated settings and report export workflows.
-- A defensible real-video training/evaluation dataset and model metadata; the prediction UI now clearly says no trained model is available and shows no forecast.
+- A validated real-video model; current database rows are not tracking-enabled, so the dataset builder returns no supervised training samples. The UI correctly shows that no recorded-video model or forecast is available.
 - Docker Compose with persistent volumes, environment settings, and health checks.
 - Broader tests for feature extraction, controller safety limits, model inference, and full dashboard interface integration.
 - Multi-seed simulation evaluation and optional SUMO/TraCI comparison.
@@ -67,13 +76,15 @@
 ## Current verification results
 
 - Test command: `.venv\Scripts\python.exe -m pytest -q`
-- Result after Phase 2 changes: `8 passed`.
+- Result after Phase 3 changes: `13 passed`.
 - `compileall` passed for `src`, `dashboard`, and `tests`; `git diff --check` passed.
 - Real video detector smoke: 24 frames processed from `14615869_3840_2160_24fps.mp4`; one car detection observed. Annotated output: `data/processed/phase1_detection_smoke.mp4`.
 - Phase 2 end-to-end smoke on the supplied recording: 113 sampled frames at confidence 0.10, two unique track IDs, two lane arrivals (one in each starter polygon), and 226 persisted lane observations in a temporary SQLite database. Output: `data/processed/phase2_tracking_smoke.mp4` (readable 1280×720 annotated frame). At the UI default confidence 0.25, a separate 24-frame smoke run returned one car track. These are smoke checks, not tracking accuracy evaluations.
+- Synthetic forecasting benchmark: 8,280 generated samples across 12 sessions; chronological split was 5,520 train / 1,380 validation / 1,380 test. Holdout XGBoost MAE 2.704, RMSE 3.455, R² 0.303; Random Forest MAE 3.088, RMSE 4.058, R² 0.038; persistence MAE 8.904, RMSE 11.136, R² -6.243. These are generated-data results only and do not describe real traffic. Artifacts are under the ignored local path `models/traffic_arrival/synthetic/`.
+- Current real-data availability check: 236 stored video observations, zero tracking-enabled rows, zero supervised samples, and no real-video trained model. No real forecast or performance claim is made.
 - Streamlit source compiles. A separate port 8502 health check could not be completed because local socket access was denied in this environment.
 - No detection precision/recall/mAP, tracking IDF1/MOTA, forecast MAE/RMSE, or real-road improvement has been established.
 
 ## Next implementation milestone
 
-Phase 3: implement the custom traffic-arrival dataset and forecasting pipeline. Use chronological recording-level splits, XGBoost as the primary model, persistence and Random Forest baselines, save model/schema/provenance/metrics, and do not enable inference until holdout evaluation succeeds. No labeled real-video dataset is currently included.
+Phase 4: audit and validate the signal strategies and simulation. Preserve the hardware-free boundary, verify min/max green, cycle, clearance, and starvation constraints, compare controllers on identical deterministic scenarios, and report limits without claiming real-road improvements.
